@@ -13,7 +13,8 @@ const defaultState = {
   settings: {
     sollStundenWoche: 15,      // vom Nutzer festgelegt
     urlaubstageJahr: 18,        // vom Nutzer festgelegt
-    arbeitstageWoche: 5         // Standard: Mo-Fr, anpassbar
+    arbeitstageWoche: 5,        // Standard: Mo-Fr, anpassbar
+    stundenlohn: 0              // € pro Stunde, vom Nutzer festgelegt
   },
   entries: [] // jeder Eintrag: {id, date, type, start, end, pauseMin, note}
 };
@@ -94,11 +95,18 @@ function isWeekday(dateISO){
   return day >= 1 && day <= 5;
 }
 
-/* Überstunden-Berechnung: für jeden Werktag von Beginn der Daten bis heute,
-   vergleichen wir geleistete Minuten mit Soll-Minuten. Urlaubs- und Kranktage
-   zählen als "erfüllt" (kein Minus). */
+/* Überstunden-Berechnung: für jeden Werktag von Beginn der Daten bis HEUTE
+   (niemals weiter — auch wenn schon Einträge für die Zukunft existieren,
+   z.B. ein im Voraus eingetragener Urlaubstag nächste Woche), vergleichen
+   wir geleistete Minuten mit Soll-Minuten. Urlaubs- und Kranktage zählen
+   als "erfüllt" (kein Minus). Zukünftige Einträge bleiben im Kalender und
+   in den Listen sichtbar, fließen aber bewusst NICHT in den Saldo ein,
+   bis der Tag tatsächlich erreicht ist. */
 function berechneUeberstunden(){
-  const entries = sortedEntries();
+  const todayIso = todayISO();
+
+  // Nur Einträge bis und mit heute zählen für den Saldo
+  const entries = sortedEntries().filter(e => e.date <= todayIso);
   if(entries.length === 0) return 0;
 
   const byDate = {};
@@ -108,9 +116,8 @@ function berechneUeberstunden(){
   });
 
   const firstDate = entries[0].date;
-  const last = todayISO();
   let cursor = new Date(firstDate + "T00:00:00");
-  const endDate = new Date(last + "T00:00:00");
+  const endDate = new Date(todayIso + "T00:00:00");
   const sollProTag = sollMinutenProTag();
   let saldoMinuten = 0;
 
@@ -132,6 +139,48 @@ function berechneUeberstunden(){
     cursor.setDate(cursor.getDate()+1);
   }
   return saldoMinuten;
+}
+
+/* Verdienst-Berechnung: zählt alle Stunden bis HEUTE (genau wie die
+   Überstunden), bei denen tatsächlich gearbeitet wurde, PLUS die
+   Soll-Stunden für Urlaubs- und Krankheitstage (die zählen wie bezahlte
+   Zeit). Zukünftige Tage fließen nicht ein. */
+function berechneVerdienstMinuten(jahr, monat){
+  // monat ist 0-indexiert (0=Januar), wie bei JS-Date üblich
+  const todayIso = todayISO();
+  const monatStr = `${jahr}-${String(monat+1).padStart(2,"0")}`;
+  const sollProTag = sollMinutenProTag();
+
+  const relevantEntries = state.entries.filter(e =>
+    e.date.startsWith(monatStr) && e.date <= todayIso && isWeekday(e.date)
+  );
+
+  const byDate = {};
+  relevantEntries.forEach(e=>{
+    if(!byDate[e.date]) byDate[e.date] = [];
+    byDate[e.date].push(e);
+  });
+
+  let minuten = 0;
+  Object.values(byDate).forEach(dayEntries=>{
+    const hasVacationOrSick = dayEntries.some(e=> e.type==="vacation" || e.type==="sick");
+    if(hasVacationOrSick){
+      minuten += sollProTag; // bezahlte Zeit, wie ein normaler Arbeitstag
+    } else {
+      minuten += dayEntries.reduce((sum,e)=> sum + entryDurationMinutes(e), 0);
+    }
+  });
+
+  return minuten;
+}
+
+function berechneVerdienstEuro(jahr, monat){
+  const stunden = berechneVerdienstMinuten(jahr, monat) / 60;
+  return stunden * (state.settings.stundenlohn || 0);
+}
+
+function fmtEuro(value){
+  return new Intl.NumberFormat('de-DE', { style:'currency', currency:'EUR' }).format(value);
 }
 
 function urlaubsTageGenommen(jahr){
@@ -183,11 +232,15 @@ function renderTodayPill(){
    ============================================================ */
 function renderDashboard(){
   const el = document.getElementById("view-dashboard");
-  const jahr = new Date().getFullYear();
+  const now = new Date();
+  const jahr = now.getFullYear();
+  const monat = now.getMonth();
   const saldo = berechneUeberstunden();
   const urlaubGenommen = urlaubsTageGenommen(jahr);
   const urlaubRest = state.settings.urlaubstageJahr - urlaubGenommen;
   const krankTage = krankTageJahr(jahr);
+  const verdienst = berechneVerdienstEuro(jahr, monat);
+  const monatsName = now.toLocaleDateString('de-DE', { month:'long' });
 
   const letzte = sortedEntries().slice(-6).reverse();
 
@@ -196,7 +249,12 @@ function renderDashboard(){
       <div class="metric">
         <p class="label">Überstunden-Saldo</p>
         <p class="value ${saldo>=0?'pos':'neg'}">${minutesToHM(saldo)}</p>
-        <p class="sub">${saldo>=0 ? 'im Plus' : 'im Minus'}</p>
+        <p class="sub">${saldo>=0 ? 'im Plus' : 'im Minus'} · bis heute</p>
+      </div>
+      <div class="metric">
+        <p class="label">Verdienst ${monatsName}</p>
+        <p class="value">${state.settings.stundenlohn>0 ? fmtEuro(verdienst) : '—'}</p>
+        <p class="sub">${state.settings.stundenlohn>0 ? `bei ${state.settings.stundenlohn} €/h, bis heute` : 'Stundenlohn in Einstellungen eintragen'}</p>
       </div>
       <div class="metric">
         <p class="label">Urlaub übrig</p>
@@ -207,11 +265,6 @@ function renderDashboard(){
         <p class="label">Krankheitstage</p>
         <p class="value">${krankTage}</p>
         <p class="sub">im Jahr ${jahr}</p>
-      </div>
-      <div class="metric">
-        <p class="label">Soll pro Woche</p>
-        <p class="value">${state.settings.sollStundenWoche} h</p>
-        <p class="sub">${state.settings.arbeitstageWoche} Arbeitstage</p>
       </div>
     </div>
 
@@ -451,26 +504,193 @@ function renderCalendar(){
 
 function showDayDetail(iso, entries){
   const detail = document.getElementById("cal-day-detail");
-  if(entries.length === 0){
-    detail.innerHTML = `
-      <div class="card">
-        <h3 class="sub-title" style="margin-top:0;">${fmtDate(iso)}</h3>
-        <p style="color:var(--text-faint);margin:0 0 12px;">Keine Einträge an diesem Tag.</p>
-        <button class="btn primary" id="add-for-day"><i class="ti ti-plus"></i>Eintrag hinzufügen</button>
-      </div>
-    `;
-    document.getElementById("add-for-day").addEventListener("click", ()=>{
-      setActiveView("entry");
-      setTimeout(()=>{ document.getElementById("f-date").value = iso; }, 0);
+
+  const entriesHtml = entries.map(e => renderEditableEntry(e)).join("");
+
+  detail.innerHTML = `
+    <div class="card">
+      <h3 class="sub-title" style="margin-top:0;">${fmtDate(iso)}</h3>
+      ${entries.length === 0 ? `<p style="color:var(--text-faint);margin:0 0 14px;">Keine Einträge an diesem Tag.</p>` : `<div id="day-entries-list">${entriesHtml}</div>`}
+      <button class="btn primary" id="add-for-day" style="margin-top:${entries.length?'14px':'0'};"><i class="ti ti-plus"></i>Eintrag für diesen Tag hinzufügen</button>
+    </div>
+  `;
+
+  // Bearbeiten-Buttons
+  detail.querySelectorAll("[data-edit-save]").forEach(btn=>{
+    btn.addEventListener("click", ()=> saveEditedEntry(btn.dataset.editSave, iso));
+  });
+  detail.querySelectorAll("[data-edit-delete]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      if(confirm("Diesen Eintrag wirklich löschen?")){
+        state.entries = state.entries.filter(e=>e.id !== btn.dataset.editDelete);
+        saveState();
+        renderCalendar();
+        setTimeout(()=>{
+          const byDate = {};
+          state.entries.forEach(e=>{ (byDate[e.date]=byDate[e.date]||[]).push(e); });
+          showDayDetail(iso, byDate[iso]||[]);
+        }, 0);
+      }
     });
-  } else {
-    detail.innerHTML = `
-      <div class="card">
-        <h3 class="sub-title" style="margin-top:0;">${fmtDate(iso)}</h3>
-        ${renderEntryTable(entries, false)}
+  });
+  // Bei Typ-Wechsel im Bearbeiten-Formular die passenden Felder ein/ausblenden
+  detail.querySelectorAll("[data-edit-type]").forEach(sel=>{
+    sel.addEventListener("change", ()=>{
+      const wrap = detail.querySelector(`[data-edit-workfields="${sel.dataset.editType}"]`);
+      if(wrap) wrap.style.display = sel.value === "work" ? "grid" : "none";
+    });
+  });
+
+  document.getElementById("add-for-day").addEventListener("click", ()=>{
+    addNewEntryInline(iso);
+  });
+}
+
+function renderEditableEntry(e){
+  const t = entryTypeLabel(e.type);
+  return `
+    <div class="card" style="background:var(--surface-2);border:1px solid var(--border);margin-bottom:10px;padding:14px 16px;">
+      <div class="form-row" style="margin-bottom:10px;">
+        <div>
+          <label>Art</label>
+          <select data-edit-type="${e.id}" id="edit-type-${e.id}">
+            <option value="work" ${e.type==="work"?"selected":""}>Arbeitszeit</option>
+            <option value="vacation" ${e.type==="vacation"?"selected":""}>Urlaub</option>
+            <option value="sick" ${e.type==="sick"?"selected":""}>Krankheit</option>
+          </select>
+        </div>
       </div>
-    `;
+      <div class="form-row" data-edit-workfields="${e.id}" style="display:${e.type==="work"?"grid":"none"};margin-bottom:10px;">
+        <div>
+          <label>Beginn</label>
+          <input type="time" id="edit-start-${e.id}" value="${e.start||"09:00"}">
+        </div>
+        <div>
+          <label>Ende</label>
+          <input type="time" id="edit-end-${e.id}" value="${e.end||"17:00"}">
+        </div>
+        <div>
+          <label>Pause (Min)</label>
+          <input type="number" id="edit-pause-${e.id}" value="${e.pauseMin!=null?e.pauseMin:30}" min="0" step="5">
+        </div>
+      </div>
+      <div style="margin-bottom:10px;">
+        <label>Notiz</label>
+        <input type="text" id="edit-note-${e.id}" value="${escapeHtml(e.note||"")}">
+      </div>
+      <div class="form-actions">
+        <button class="btn primary" data-edit-save="${e.id}"><i class="ti ti-check"></i>Speichern</button>
+        <button class="btn danger" data-edit-delete="${e.id}"><i class="ti ti-trash"></i>Löschen</button>
+      </div>
+    </div>
+  `;
+}
+
+function saveEditedEntry(id, iso){
+  const type = document.getElementById(`edit-type-${id}`).value;
+  const note = document.getElementById(`edit-note-${id}`).value.trim();
+  const entry = state.entries.find(e=>e.id===id);
+  if(!entry) return;
+
+  entry.type = type;
+  entry.note = note;
+
+  if(type === "work"){
+    const start = document.getElementById(`edit-start-${id}`).value;
+    const end = document.getElementById(`edit-end-${id}`).value;
+    const pauseMin = Number(document.getElementById(`edit-pause-${id}`).value) || 0;
+    if(!start || !end || diffMinutes(start,end,pauseMin) <= 0){
+      alert("Die Endzeit muss nach der Beginnzeit liegen (Pause berücksichtigt).");
+      return;
+    }
+    entry.start = start;
+    entry.end = end;
+    entry.pauseMin = pauseMin;
+  } else {
+    delete entry.start;
+    delete entry.end;
+    delete entry.pauseMin;
   }
+
+  saveState();
+  renderCalendar();
+  setTimeout(()=>{
+    const byDate = {};
+    state.entries.forEach(e=>{ (byDate[e.date]=byDate[e.date]||[]).push(e); });
+    showDayDetail(iso, byDate[iso]||[]);
+  }, 0);
+}
+
+function addNewEntryInline(iso){
+  const detail = document.getElementById("cal-day-detail");
+  const newId = "_new_" + uid();
+  const card = document.createElement("div");
+  card.innerHTML = `
+    <div class="card" style="margin-top:14px;padding:14px 16px;">
+      <div class="form-row" style="margin-bottom:10px;">
+        <div>
+          <label>Art</label>
+          <select id="new-type-${newId}">
+            <option value="work">Arbeitszeit</option>
+            <option value="vacation">Urlaub</option>
+            <option value="sick">Krankheit</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row" id="new-workfields-${newId}" style="margin-bottom:10px;">
+        <div>
+          <label>Beginn</label>
+          <input type="time" id="new-start-${newId}" value="09:00">
+        </div>
+        <div>
+          <label>Ende</label>
+          <input type="time" id="new-end-${newId}" value="17:00">
+        </div>
+        <div>
+          <label>Pause (Min)</label>
+          <input type="number" id="new-pause-${newId}" value="30" min="0" step="5">
+        </div>
+      </div>
+      <div style="margin-bottom:10px;">
+        <label>Notiz (optional)</label>
+        <input type="text" id="new-note-${newId}">
+      </div>
+      <div class="form-actions">
+        <button class="btn primary" id="new-save-${newId}"><i class="ti ti-check"></i>Speichern</button>
+      </div>
+    </div>
+  `;
+  detail.appendChild(card);
+
+  document.getElementById(`new-type-${newId}`).addEventListener("change", function(){
+    document.getElementById(`new-workfields-${newId}`).style.display = this.value==="work" ? "grid" : "none";
+  });
+
+  document.getElementById(`new-save-${newId}`).addEventListener("click", ()=>{
+    const type = document.getElementById(`new-type-${newId}`).value;
+    const note = document.getElementById(`new-note-${newId}`).value.trim();
+    let entry = { id: uid(), date: iso, type, note };
+
+    if(type === "work"){
+      const start = document.getElementById(`new-start-${newId}`).value;
+      const end = document.getElementById(`new-end-${newId}`).value;
+      const pauseMin = Number(document.getElementById(`new-pause-${newId}`).value) || 0;
+      if(!start || !end || diffMinutes(start,end,pauseMin) <= 0){
+        alert("Die Endzeit muss nach der Beginnzeit liegen (Pause berücksichtigt).");
+        return;
+      }
+      entry = { ...entry, start, end, pauseMin };
+    }
+
+    state.entries.push(entry);
+    saveState();
+    renderCalendar();
+    setTimeout(()=>{
+      const byDate = {};
+      state.entries.forEach(e=>{ (byDate[e.date]=byDate[e.date]||[]).push(e); });
+      showDayDetail(iso, byDate[iso]||[]);
+    }, 0);
+  });
 }
 
 /* ============================================================
@@ -619,6 +839,10 @@ function renderSettings(){
           <label for="s-urlaub">Urlaubstage pro Jahr</label>
           <input type="number" id="s-urlaub" value="${state.settings.urlaubstageJahr}" min="0" step="1">
         </div>
+        <div>
+          <label for="s-lohn">Stundenlohn (€)</label>
+          <input type="number" id="s-lohn" value="${state.settings.stundenlohn}" min="0" step="0.5">
+        </div>
       </div>
       <div class="form-actions">
         <button class="btn primary" id="s-save"><i class="ti ti-check"></i>Einstellungen speichern</button>
@@ -652,13 +876,15 @@ function renderSettings(){
     const soll = Number(document.getElementById("s-soll").value);
     const tage = Number(document.getElementById("s-tage").value);
     const urlaub = Number(document.getElementById("s-urlaub").value);
-    if(soll<=0 || tage<=0 || tage>7 || urlaub<0){
+    const lohn = Number(document.getElementById("s-lohn").value);
+    if(soll<=0 || tage<=0 || tage>7 || urlaub<0 || lohn<0){
       alert("Bitte gültige Werte eingeben.");
       return;
     }
     state.settings.sollStundenWoche = soll;
     state.settings.arbeitstageWoche = tage;
     state.settings.urlaubstageJahr = urlaub;
+    state.settings.stundenlohn = lohn;
     saveState();
     alert("Einstellungen gespeichert.");
   });
