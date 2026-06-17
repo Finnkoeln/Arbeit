@@ -625,6 +625,17 @@ function renderSettings(){
       </div>
     </div>
 
+    <h3 class="sub-title">Import aus Excel oder CSV</h3>
+    <div class="card" style="margin-bottom:24px;">
+      <p style="margin:0 0 14px;color:var(--text-muted);">
+        Lade eine Excel-Datei (.xlsx) oder CSV-Datei mit Einträgen hoch. Die Datei sollte die gleichen Spalten haben
+        wie der Export unter „Statistik“: Datum, Art, Beginn, Ende, Pause (Min), Stunden, Notiz.
+        Bei „Art“ werden die Werte „Arbeit“, „Urlaub“ und „Krankheit“ erkannt.
+      </p>
+      <input type="file" id="import-file" accept=".csv,.xlsx,.xls" style="margin-bottom:12px;">
+      <div id="import-status" style="font-size:13px;color:var(--text-muted);"></div>
+    </div>
+
     <h3 class="sub-title">Daten</h3>
     <div class="card">
       <p style="margin:0 0 14px;color:var(--text-muted);">
@@ -634,6 +645,8 @@ function renderSettings(){
       <button class="btn danger" id="s-reset"><i class="ti ti-trash"></i>Alle Daten löschen</button>
     </div>
   `;
+
+  document.getElementById("import-file").addEventListener("change", onImportFile);
 
   document.getElementById("s-save").addEventListener("click", ()=>{
     const soll = Number(document.getElementById("s-soll").value);
@@ -657,6 +670,218 @@ function renderSettings(){
       renderSettings();
       alert("Alle Daten wurden gelöscht.");
     }
+  });
+}
+
+/* ============================================================
+   IMPORT AUS EXCEL / CSV
+   ============================================================ */
+
+/* Wandelt die Werte aus der Spalte "Art" in unsere internen Typen um.
+   So funktioniert es auch, wenn jemand in Excel "arbeit" klein schreibt
+   oder ein Leerzeichen zu viel hat. */
+function parseTypeValue(raw){
+  const v = String(raw||"").trim().toLowerCase();
+  if(v.startsWith("arbeit") || v==="work") return "work";
+  if(v.startsWith("urlaub") || v==="vacation") return "vacation";
+  if(v.startsWith("krank") || v==="sick") return "sick";
+  return null;
+}
+
+/* Wandelt verschiedene Datumsformate in unser internes Format YYYY-MM-DD um.
+   Unterstützt: TT.MM.JJJJ (unser eigener Export), JJJJ-MM-TT, und
+   Excel-Datums-Seriennummern (Excel speichert Datumswerte intern als Zahl). */
+function parseDateValue(raw){
+  if(raw == null || raw === "") return null;
+
+  // Excel-Datumsseriennummer (z.B. 45678)
+  if(typeof raw === "number"){
+    const excelEpoch = new Date(Date.UTC(1899,11,30));
+    const d = new Date(excelEpoch.getTime() + raw*86400000);
+    return d.toISOString().slice(0,10);
+  }
+
+  const s = String(raw).trim();
+
+  // TT.MM.JJJJ
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if(m) return `${m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+
+  // JJJJ-MM-TT
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(m) return `${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}`;
+
+  // TT/MM/JJJJ
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m) return `${m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+
+  return null;
+}
+
+/* Normalisiert Uhrzeit-Werte zu HH:MM. Excel liefert Zeiten manchmal als
+   Bruchzahl des Tages (z.B. 0.375 = 09:00), manchmal als Text "9:00". */
+function parseTimeValue(raw){
+  if(raw == null || raw === "") return null;
+  if(typeof raw === "number"){
+    const totalMin = Math.round(raw*24*60);
+    const h = Math.floor(totalMin/60), m = totalMin%60;
+    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+  }
+  const s = String(raw).trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})/);
+  if(m) return `${m[1].padStart(2,"0")}:${m[2]}`;
+  return null;
+}
+
+/* Liest eine Reihe von Tabellenzeilen (Array von Objekten mit Spaltennamen
+   als Schlüssel) und wandelt sie in unsere Eintrags-Struktur um.
+   Gibt { gueltig: [...], fehler: [...] } zurück. */
+function parseImportRows(rows){
+  const gueltig = [];
+  const fehler = [];
+
+  rows.forEach((row, idx)=>{
+    // Spaltennamen flexibel suchen (Groß-/Kleinschreibung, leicht abweichende Namen)
+    const get = (...names) => {
+      for(const key of Object.keys(row)){
+        const norm = key.trim().toLowerCase();
+        if(names.includes(norm)) return row[key];
+      }
+      return undefined;
+    };
+
+    const dateRaw = get("datum");
+    const typeRaw = get("art");
+    const date = parseDateValue(dateRaw);
+    const type = parseTypeValue(typeRaw);
+
+    if(!date || !type){
+      fehler.push({ zeile: idx+2, grund: !date ? "Datum nicht erkannt" : "Art nicht erkannt (Arbeit/Urlaub/Krankheit erwartet)" });
+      return;
+    }
+
+    const note = get("notiz") || "";
+
+    if(type === "work"){
+      const start = parseTimeValue(get("beginn"));
+      const end = parseTimeValue(get("ende"));
+      const pauseRaw = get("pause (min)", "pause");
+      const pauseMin = Number(pauseRaw) || 0;
+      if(!start || !end){
+        fehler.push({ zeile: idx+2, grund: "Beginn oder Ende fehlt/unlesbar für Arbeitszeit-Eintrag" });
+        return;
+      }
+      if(diffMinutes(start,end,pauseMin) <= 0){
+        fehler.push({ zeile: idx+2, grund: "Ende liegt nicht nach Beginn" });
+        return;
+      }
+      gueltig.push({ id: uid(), date, type, start, end, pauseMin, note: String(note||"") });
+    } else {
+      gueltig.push({ id: uid(), date, type, note: String(note||"") });
+    }
+  });
+
+  return { gueltig, fehler };
+}
+
+function onImportFile(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const status = document.getElementById("import-status");
+  status.textContent = "Datei wird gelesen …";
+
+  const isCSV = file.name.toLowerCase().endsWith(".csv");
+
+  const reader = new FileReader();
+  reader.onerror = () => {
+    status.textContent = "Die Datei konnte nicht gelesen werden.";
+  };
+
+  reader.onload = (evt) => {
+    try{
+      let rows;
+      if(isCSV){
+        rows = parseCSVText(evt.target.result);
+      } else {
+        const data = new Uint8Array(evt.target.result);
+        const workbook = XLSX.read(data, { type: "array", cellDates:false });
+        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(firstSheet, { defval: "" });
+      }
+
+      const { gueltig, fehler } = parseImportRows(rows);
+
+      if(gueltig.length === 0){
+        status.innerHTML = `Es konnten keine gültigen Einträge gefunden werden.${fehler.length ? "<br>Beispiel-Problem: Zeile "+fehler[0].zeile+" – "+fehler[0].grund : ""}`;
+        return;
+      }
+
+      let meldung = `${gueltig.length} Einträge gefunden`;
+      if(fehler.length) meldung += `, ${fehler.length} Zeile(n) konnten nicht gelesen werden`;
+      status.textContent = meldung + ". Bitte wähle, was passieren soll …";
+
+      askImportMode(gueltig, fehler);
+
+    }catch(err){
+      console.error(err);
+      status.textContent = "Die Datei hat ein unerwartetes Format und konnte nicht verarbeitet werden.";
+    }
+    e.target.value = ""; // Datei-Auswahl zurücksetzen, damit erneutes Hochladen derselben Datei funktioniert
+  };
+
+  if(isCSV) reader.readAsText(file, "utf-8");
+  else reader.readAsArrayBuffer(file);
+}
+
+/* Einfacher CSV-Parser, passend zum eigenen Export-Format (Semikolon-getrennt). */
+function parseCSVText(text){
+  const cleanText = text.replace(/^\uFEFF/, ""); // BOM entfernen, falls vorhanden
+  const lines = cleanText.split(/\r?\n/).filter(l => l.trim() !== "");
+  if(lines.length === 0) return [];
+  const headers = lines[0].split(";").map(h=>h.trim());
+  return lines.slice(1).map(line=>{
+    const cells = line.split(";");
+    const obj = {};
+    headers.forEach((h,i)=>{ obj[h] = cells[i] !== undefined ? cells[i].trim() : ""; });
+    return obj;
+  });
+}
+
+function askImportMode(gueltig, fehler){
+  const status = document.getElementById("import-status");
+  const fehlerListe = fehler.length
+    ? `<div style="margin-top:8px;color:var(--warn);">${fehler.length} Zeile(n) übersprungen: ${fehler.slice(0,3).map(f=>`Zeile ${f.zeile} (${f.grund})`).join(", ")}${fehler.length>3 ? " …" : ""}</div>`
+    : "";
+
+  status.innerHTML = `
+    <div class="card" style="margin-top:10px;padding:14px 16px;">
+      <p style="margin:0 0 12px;">
+        <strong>${gueltig.length} Einträge</strong> wurden in der Datei gefunden. Was soll passieren?
+      </p>
+      ${fehlerListe}
+      <div class="form-actions" style="margin-top:12px;">
+        <button class="btn primary" id="import-add"><i class="ti ti-plus"></i>Zu vorhandenen Einträgen hinzufügen</button>
+        <button class="btn danger" id="import-replace"><i class="ti ti-replace"></i>Vorhandene Einträge ersetzen</button>
+        <button class="btn" id="import-cancel"><i class="ti ti-x"></i>Abbrechen</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("import-add").addEventListener("click", ()=>{
+    state.entries = [...state.entries, ...gueltig];
+    saveState();
+    status.innerHTML = `<span style="color:var(--accent-strong);">${gueltig.length} Einträge wurden hinzugefügt.</span>`;
+  });
+
+  document.getElementById("import-replace").addEventListener("click", ()=>{
+    if(!confirm("Wirklich ALLE vorhandenen Einträge durch die Datei ersetzen? Das kann nicht rückgängig gemacht werden.")) return;
+    state.entries = gueltig;
+    saveState();
+    status.innerHTML = `<span style="color:var(--accent-strong);">Einträge wurden ersetzt (${gueltig.length} Einträge aus der Datei).</span>`;
+  });
+
+  document.getElementById("import-cancel").addEventListener("click", ()=>{
+    status.textContent = "Import abgebrochen.";
   });
 }
 
